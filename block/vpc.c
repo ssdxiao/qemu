@@ -33,6 +33,10 @@
 /**************************************************************/
 
 #define HEADER_SIZE 512
+#define DYNAMIC_HEADER_SIZE 1024
+#define PARENT_LOCATOR_NUM 8
+#define TBBATMAP_HEAD_SIZE 28
+#define MACX 0x5863614d
 
 //#define CACHE
 
@@ -138,6 +142,18 @@ typedef struct BDRVVPCState {
     Error *migration_blocker;
 } BDRVVPCState;
 
+typedef struct vhd_tdbatmap_header {
+    char    magic[8]; /* "tdbatmap"*/
+
+    /* byte offset to batmap*/
+    uint64_t    batmap_offset;
+
+    /* Offset of the Block Allocation Table (BAT)*/
+    uint32_t    batmap_size;
+    uint32_t    batmap_version;
+    uint32_t    checksum;
+} QEMU_PACKED VHDTdBatmapHeader;
+
 static uint32_t vpc_checksum(uint8_t* buf, size_t size)
 {
     uint32_t res = 0;
@@ -164,11 +180,16 @@ static int vpc_open(BlockDriverState *bs, QDict *options, int flags,
     int i;
     VHDFooter *footer;
     VHDDynDiskHeader *dyndisk_header;
-    uint8_t buf[HEADER_SIZE];
+    uint8_t dynamic_header_buf[DYNAMIC_HEADER_SIZE];
     uint32_t checksum;
     uint64_t computed_size;
     int disk_type = VHD_DYNAMIC;
     int ret;
+    VHDTdBatmapHeader *tdbatmap_header;
+    uint8_t tdbatmap_header_buf[TBBATMAP_HEAD_SIZE];
+    int parent_locator_offset = 0;
+    int data_offset = 0;
+    int data_length = 0;
 
     ret = bdrv_pread(bs->file, 0, s->footer_buf, HEADER_SIZE);
     if (ret < 0) {
@@ -231,13 +252,13 @@ static int vpc_open(BlockDriverState *bs, QDict *options, int flags,
     }
 
     if (disk_type == VHD_DYNAMIC) {
-        ret = bdrv_pread(bs->file, be64_to_cpu(footer->data_offset), buf,
-                         HEADER_SIZE);
+        ret = bdrv_pread(bs->file, be64_to_cpu(footer->data_offset),
+                         dynamic_header_buf, DYNAMIC_HEADER_SIZE);
         if (ret < 0) {
             goto fail;
         }
 
-        dyndisk_header = (VHDDynDiskHeader *) buf;
+        dyndisk_header = (VHDDynDiskHeader *) dynamic_header_buf;
 
         if (strncmp(dyndisk_header->magic, "cxsparse", 8)) {
             ret = -EINVAL;
@@ -281,6 +302,46 @@ static int vpc_open(BlockDriverState *bs, QDict *options, int flags,
 
         s->free_data_block_offset =
             (s->bat_offset + (s->max_table_entries * 4) + 511) & ~511;
+
+        /* read tdbatmap offset*/
+        ret = bdrv_pread(bs->file, s->free_data_block_offset,
+                        tdbatmap_header_buf, TBBATMAP_HEAD_SIZE);
+        if (ret < 0) {
+            goto fail;
+        }
+
+        tdbatmap_header = (VHDTdBatmapHeader *) tdbatmap_header_buf;
+
+        if (!strncmp(tdbatmap_header->magic, "tdbatmap", 8)) {
+            s->free_data_block_offset = be64_to_cpu(
+                            tdbatmap_header->batmap_offset)
+                    + be32_to_cpu(tdbatmap_header->batmap_size) * 512;
+        }
+
+        /* read backend file*/
+        if (dyndisk_header->parent_name[0] || dyndisk_header->parent_name[1]) {
+            for (i = 0; i < PARENT_LOCATOR_NUM; i++) {
+                data_offset = be64_to_cpu(
+                                dyndisk_header->parent_locator[i].data_offset);
+                data_length = be32_to_cpu(
+                                dyndisk_header->parent_locator[i].data_length);
+                if (dyndisk_header->parent_locator[i].platform == MACX) {
+                    ret = bdrv_pread(bs->file, data_offset + 7,
+                              bs->backing_file, data_length - 7);
+                    if (ret < 0) {
+                        goto fail;
+                    }
+                    bs->backing_file[data_length - 7] = '\0';
+                }
+                if (data_offset > parent_locator_offset) {
+                    parent_locator_offset = data_offset;
+                }
+            }
+        }
+
+        if (parent_locator_offset + 512 > s->free_data_block_offset) {
+            s->free_data_block_offset = parent_locator_offset + 512;
+        }
 
         for (i = 0; i < s->max_table_entries; i++) {
             be32_to_cpus(&s->pagetable[i]);
@@ -364,6 +425,9 @@ static inline int64_t get_sector_offset(BlockDriverState *bs,
     // bitmap each time we write to a new block. This might cause Virtual PC to
     // miss sparse read optimization, but it's not a problem in terms of
     // correctness.
+
+    /*this will not use*/
+#if 0
     if (write && (s->last_bitmap_offset != bitmap_offset)) {
         uint8_t bitmap[s->bitmap_size];
 
@@ -371,6 +435,7 @@ static inline int64_t get_sector_offset(BlockDriverState *bs,
         memset(bitmap, 0xff, s->bitmap_size);
         bdrv_pwrite_sync(bs->file, bitmap_offset, bitmap, s->bitmap_size);
     }
+#endif
 
 //    printf("sector: %" PRIx64 ", index: %x, offset: %x, bioff: %" PRIx64 ", bloff: %" PRIx64 "\n",
 //	sector_num, pagetable_index, pageentry_index,
@@ -433,7 +498,7 @@ static int rewrite_footer(BlockDriverState* bs)
  *
  * Returns the sectors' offset in the image file on success and < 0 on error
  */
-static int64_t alloc_block(BlockDriverState* bs, int64_t sector_num)
+static int64_t alloc_block(BlockDriverState *bs, int64_t sector_num, int diff)
 {
     BDRVVPCState *s = bs->opaque;
     int64_t bat_offset;
@@ -453,7 +518,12 @@ static int64_t alloc_block(BlockDriverState* bs, int64_t sector_num)
     s->pagetable[index] = s->free_data_block_offset / 512;
 
     // Initialize the block's bitmap
-    memset(bitmap, 0xff, s->bitmap_size);
+    /* if VHD_DIFFERENCING, will set bitmap to 0x00 mean not use*/
+    if (diff) {
+        memset(bitmap, 0x00, s->bitmap_size);
+    } else {
+        memset(bitmap, 0xff, s->bitmap_size);
+    }
     ret = bdrv_pwrite_sync(bs->file, s->free_data_block_offset, bitmap,
         s->bitmap_size);
     if (ret < 0) {
@@ -493,6 +563,46 @@ static int vpc_get_info(BlockDriverState *bs, BlockDriverInfo *bdi)
     return 0;
 }
 
+static inline int64_t get_sector_offset_diff(BlockDriverState *bs,
+                    int64_t sector_num)
+{
+    BDRVVPCState *s = bs->opaque;
+    uint64_t offset = sector_num * 512;
+    uint64_t bitmap_offset;
+    uint32_t pagetable_index, pageentry_index;
+    uint8_t bitmap[s->bitmap_size];
+    uint32_t bitmap_index, bitmapentry_index;
+    int ret;
+
+    pagetable_index = offset / s->block_size;
+    pageentry_index = (offset % s->block_size) / 512;
+
+    if (pagetable_index >= s->max_table_entries) {
+        return -1;
+    }
+
+    if (s->pagetable[pagetable_index] == 0xffffffff) {
+        return -2;
+    }
+
+    bitmap_offset = 512 * (uint64_t) s->pagetable[pagetable_index];
+
+    ret = bdrv_pread(bs->file, bitmap_offset, bitmap, s->bitmap_size);
+    if (ret < 0) {
+        return -1;
+    }
+
+    bitmap_index = pageentry_index / 8;
+    bitmapentry_index = 7 - pageentry_index % 8;
+
+    if (bitmap[bitmap_index] & 0x01 << bitmapentry_index) {
+        return bitmap_offset + s->bitmap_size + (512 * pageentry_index);
+    } else {
+        return -2;
+    }
+}
+
+
 static int vpc_read(BlockDriverState *bs, int64_t sector_num,
                     uint8_t *buf, int nb_sectors)
 {
@@ -501,33 +611,64 @@ static int vpc_read(BlockDriverState *bs, int64_t sector_num,
     int64_t offset;
     int64_t sectors, sectors_per_block;
     VHDFooter *footer = (VHDFooter *) s->footer_buf;
+    QEMUIOVector hd_qiov;
+    struct iovec qiov;
 
     if (cpu_to_be32(footer->type) == VHD_FIXED) {
         return bdrv_read(bs->file, sector_num, buf, nb_sectors);
-    }
-    while (nb_sectors > 0) {
-        offset = get_sector_offset(bs, sector_num, 0);
+    } else if (cpu_to_be32(footer->type) == VHD_DYNAMIC) {
+        while (nb_sectors > 0) {
+            offset = get_sector_offset(bs, sector_num, 0);
 
-        sectors_per_block = s->block_size >> BDRV_SECTOR_BITS;
-        sectors = sectors_per_block - (sector_num % sectors_per_block);
-        if (sectors > nb_sectors) {
-            sectors = nb_sectors;
-        }
-
-        if (offset == -1) {
-            memset(buf, 0, sectors * BDRV_SECTOR_SIZE);
-        } else {
-            ret = bdrv_pread(bs->file, offset, buf,
-                sectors * BDRV_SECTOR_SIZE);
-            if (ret != sectors * BDRV_SECTOR_SIZE) {
-                return -1;
+            sectors_per_block = s->block_size >> BDRV_SECTOR_BITS;
+            sectors = sectors_per_block - (sector_num % sectors_per_block);
+            if (sectors > nb_sectors) {
+                sectors = nb_sectors;
             }
-        }
 
-        nb_sectors -= sectors;
-        sector_num += sectors;
-        buf += sectors * BDRV_SECTOR_SIZE;
+            if (offset == -1) {
+                memset(buf, 0, sectors * BDRV_SECTOR_SIZE);
+            } else {
+                ret = bdrv_pread(bs->file, offset, buf,
+                    sectors * BDRV_SECTOR_SIZE);
+               if (ret != sectors * BDRV_SECTOR_SIZE) {
+                    return -1;
+                }
+            }
+
+            nb_sectors -= sectors;
+            sector_num += sectors;
+            buf += sectors * BDRV_SECTOR_SIZE;
+        }
+    } else {
+         while (nb_sectors > 0) {
+            offset = get_sector_offset_diff(bs, sector_num);
+            if (offset == -1) {
+                memset(buf, 0, BDRV_SECTOR_SIZE);
+            } else if (offset == -2) {
+                qiov.iov_base = (void *)buf;
+                qiov.iov_len = 512;
+                hd_qiov.iov = &qiov;
+                hd_qiov.niov = 1;
+                hd_qiov.nalloc = -1;
+                hd_qiov.size = 512;
+                ret = bdrv_co_readv(bs->backing_hd, sector_num, 1, &hd_qiov);
+                if (ret < 0) {
+                    return -1;
+                }
+
+            } else {
+                ret = bdrv_pread(bs->file, offset, buf, BDRV_SECTOR_SIZE);
+                if (ret != BDRV_SECTOR_SIZE) {
+                    return -1;
+                }
+            }
+             nb_sectors--;
+             sector_num++;
+             buf += BDRV_SECTOR_SIZE;
+	 }
     }
+
     return 0;
 }
 
@@ -542,6 +683,45 @@ static coroutine_fn int vpc_co_read(BlockDriverState *bs, int64_t sector_num,
     return ret;
 }
 
+static inline int64_t write_bitmap(BlockDriverState *bs,
+                int64_t sector_num, int64_t sectors)
+{
+    BDRVVPCState *s = bs->opaque;
+    uint64_t offset = sector_num * 512;
+    uint64_t bitmap_offset;
+    uint32_t pagetable_index, pageentry_index;
+    uint8_t bitmap[s->bitmap_size];
+    int i;
+    int ret;
+    int bitmap_index, bitmapbit_index;
+
+    pagetable_index = offset / s->block_size;
+    pageentry_index = (offset % s->block_size) / 512;
+
+    bitmap_offset = 512 * (uint64_t) s->pagetable[pagetable_index];
+
+    ret = bdrv_pread(bs->file, bitmap_offset, bitmap, s->bitmap_size);
+    if (ret < 0) {
+        return -1;
+    }
+
+    for (i = 0; i < sectors; i++) {
+        bitmap_index = pageentry_index/8;
+        bitmapbit_index = 7 - pageentry_index % 8;
+        bitmap[bitmap_index] |= (0x01 << bitmapbit_index);
+        pageentry_index++;
+    }
+
+    ret = bdrv_pwrite(bs->file, bitmap_offset, bitmap, s->bitmap_size);
+    if (ret < 0) {
+        return -1;
+    }
+
+    return 0;
+
+}
+
+
 static int vpc_write(BlockDriverState *bs, int64_t sector_num,
     const uint8_t *buf, int nb_sectors)
 {
@@ -553,30 +733,65 @@ static int vpc_write(BlockDriverState *bs, int64_t sector_num,
 
     if (cpu_to_be32(footer->type) == VHD_FIXED) {
         return bdrv_write(bs->file, sector_num, buf, nb_sectors);
-    }
-    while (nb_sectors > 0) {
-        offset = get_sector_offset(bs, sector_num, 1);
+    } else if (cpu_to_be32(footer->type) == VHD_DYNAMIC) {
+        while (nb_sectors > 0) {
+            offset = get_sector_offset(bs, sector_num, 1);
 
-        sectors_per_block = s->block_size >> BDRV_SECTOR_BITS;
-        sectors = sectors_per_block - (sector_num % sectors_per_block);
-        if (sectors > nb_sectors) {
-            sectors = nb_sectors;
-        }
+            sectors_per_block = s->block_size >> BDRV_SECTOR_BITS;
+            sectors = sectors_per_block - (sector_num % sectors_per_block);
+            if (sectors > nb_sectors) {
+                sectors = nb_sectors;
+            }
 
-        if (offset == -1) {
-            offset = alloc_block(bs, sector_num);
-            if (offset < 0)
+            if (offset == -1) {
+                offset = alloc_block(bs, sector_num , 0);
+                if (offset < 0) {
+                    return -1;
+                }
+            }
+
+            ret = bdrv_pwrite(bs->file, offset, buf,
+                            sectors * BDRV_SECTOR_SIZE);
+            if (ret != sectors * BDRV_SECTOR_SIZE) {
                 return -1;
-        }
+            }
 
-        ret = bdrv_pwrite(bs->file, offset, buf, sectors * BDRV_SECTOR_SIZE);
-        if (ret != sectors * BDRV_SECTOR_SIZE) {
-            return -1;
-        }
+            nb_sectors -= sectors;
+            sector_num += sectors;
+            buf += sectors * BDRV_SECTOR_SIZE;
+            }
+    } else {
+        while (nb_sectors > 0) {
+            offset = get_sector_offset(bs, sector_num, 1);
 
-        nb_sectors -= sectors;
-        sector_num += sectors;
-        buf += sectors * BDRV_SECTOR_SIZE;
+            sectors_per_block = s->block_size >> BDRV_SECTOR_BITS;
+            sectors = sectors_per_block - (sector_num % sectors_per_block);
+            if (sectors > nb_sectors) {
+                sectors = nb_sectors;
+            }
+
+            if (offset == -1) {
+                offset = alloc_block(bs, sector_num, 1);
+                if (offset < 0) {
+                    return -1;
+                }
+            }
+
+            ret = bdrv_pwrite(bs->file, offset, buf,
+                            sectors * BDRV_SECTOR_SIZE);
+            if (ret != sectors * BDRV_SECTOR_SIZE) {
+                return -1;
+            }
+
+            ret = write_bitmap(bs, sector_num, sectors);
+            if (ret < 0) {
+                return -1;
+            }
+
+            nb_sectors -= sectors;
+            sector_num += sectors;
+            buf += sectors * BDRV_SECTOR_SIZE;
+	}
     }
 
     return 0;
@@ -900,6 +1115,7 @@ static BlockDriver bdrv_vpc = {
 
     .bdrv_read              = vpc_co_read,
     .bdrv_write             = vpc_co_write,
+    .supports_backing           = true,
 
     .bdrv_get_info          = vpc_get_info,
 
